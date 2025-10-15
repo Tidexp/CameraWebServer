@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "esp_http_server.h"
+#include "esp_http_client.h"
 #include "esp_timer.h"
 #include "esp_camera.h"
 #include "img_converters.h"
@@ -21,6 +22,8 @@
 #include "fd_forward.h"
 #include "fr_forward.h"
 #include "fr_flash.h"
+#include "freertos/queue.h"
+#include "esp_task_wdt.h"  // ADDED: For watchdog management
 
 #define ENROLL_CONFIRM_TIMES 5
 #define FACE_ID_SAVE_NUMBER 7
@@ -33,6 +36,10 @@
 #define FACE_COLOR_YELLOW (FACE_COLOR_RED | FACE_COLOR_GREEN)
 #define FACE_COLOR_CYAN   (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
 #define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
+#define MAX_ENROLL 20
+
+// Pin relay mở cửa
+#define RELAY_PIN 13
 
 typedef struct {
         size_t size; //number of values used for filtering
@@ -43,9 +50,33 @@ typedef struct {
 } ra_filter_t;
 
 typedef struct {
+    float embedding[FACE_ID_SIZE];
+} face_embedding_t;
+
+QueueHandle_t face_queue;
+
+typedef struct {
         httpd_req_t *req;
         size_t len;
 } jpg_chunking_t;
+
+typedef struct {
+    int id;                     // auto increment
+    float embedding[FACE_ID_SIZE]; // thông số khuôn mặt
+} enroll_face_t;
+
+typedef struct {
+    enroll_face_t faces[MAX_ENROLL];
+    int count;
+    int next_id;
+} enroll_list_t;
+
+static enroll_list_t list_enroll;  // không khởi tạo tại chỗ
+
+void init_enroll_list() {
+    list_enroll.count = 0;
+    list_enroll.next_id = 0;
+}
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
@@ -216,6 +247,8 @@ static size_t jpg_encode_stream(void * arg, size_t index, const void* data, size
 }
 
 static esp_err_t capture_handler(httpd_req_t *req){
+    esp_task_wdt_reset();  // ADDED: Reset watchdog
+    
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
     int64_t fr_start = esp_timer_get_time();
@@ -275,10 +308,12 @@ static esp_err_t capture_handler(httpd_req_t *req){
         return ESP_FAIL;
     }
 
+    esp_task_wdt_reset();  // ADDED: Reset before face detection
     box_array_t *net_boxes = face_detect(image_matrix, &mtmn_config);
 
     if (net_boxes){
         detected = true;
+        esp_task_wdt_reset();  // ADDED: Reset after detection
         if(recognition_enabled){
             face_id = run_face_recognition(image_matrix, net_boxes);
         }
@@ -330,6 +365,8 @@ static esp_err_t stream_handler(httpd_req_t *req){
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     while(true){
+        esp_task_wdt_reset();  // ADDED: Reset watchdog at start of loop
+        
         detected = false;
         face_id = 0;
         fb = esp_camera_fb_get();
@@ -370,6 +407,7 @@ static esp_err_t stream_handler(httpd_req_t *req){
                         fr_ready = esp_timer_get_time();
                         box_array_t *net_boxes = NULL;
                         if(detection_enabled){
+                            esp_task_wdt_reset();  // ADDED: Before detection
                             net_boxes = face_detect(image_matrix, &mtmn_config);
                         }
                         fr_face = esp_timer_get_time();
@@ -377,6 +415,7 @@ static esp_err_t stream_handler(httpd_req_t *req){
                         if (net_boxes || fb->format != PIXFORMAT_JPEG){
                             if(net_boxes){
                                 detected = true;
+                                esp_task_wdt_reset();  // ADDED: After detection
                                 if(recognition_enabled){
                                     face_id = run_face_recognition(image_matrix, net_boxes);
                                 }
@@ -588,169 +627,188 @@ static esp_err_t index_handler(httpd_req_t *req){
     return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
 }
 
-// endpoint thông số khuôn mặt
+// endpoint thông số khuôn mặt + nhận diện
 static esp_err_t face_info_handler(httpd_req_t *req) {
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (!fb) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) return httpd_resp_send_500(req);
 
     dl_matrix3du_t *image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
-    if (!image_matrix) {
-        esp_camera_fb_return(fb);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
+    if (!image_matrix) { esp_camera_fb_return(fb); return httpd_resp_send_500(req); }
 
-    bool ok = fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item);
-    esp_camera_fb_return(fb);
-    if (!ok) {
-        dl_matrix3du_free(image_matrix);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
+    if (!fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item)) {
+        dl_matrix3du_free(image_matrix); esp_camera_fb_return(fb); return httpd_resp_send_500(req);
     }
+    esp_camera_fb_return(fb);
 
     box_array_t *faces = face_detect(image_matrix, &mtmn_config);
-    const size_t JSON_BUF_SZ = 8192;
-    char *json = (char*)malloc(JSON_BUF_SZ);
-    if (!json) {
-        if(faces) {
-            free(faces->score);
-            free(faces->box);
-            free(faces->landmark);
-            free(faces);
-        }
-        dl_matrix3du_free(image_matrix);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
 
-    char *p = json;
-    size_t rem = JSON_BUF_SZ;
+    const size_t JSON_BUF_SZ = 16384; // tăng buffer
+    char *json = (char*)malloc(JSON_BUF_SZ);
+    if (!json) { if(faces) free(faces->score); free(faces->box); free(faces->landmark); free(faces); dl_matrix3du_free(image_matrix); return httpd_resp_send_500(req); }
+
+    char *p = json; size_t rem = JSON_BUF_SZ;
     int n = snprintf(p, rem, "{\"faces\":[");
-    if (n < 0 || (size_t)n >= rem) {
-        free(json);
-        dl_matrix3du_free(image_matrix);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
     p += n; rem -= n;
 
-    if (faces && faces->len > 0) {
-        for (int i = 0; i < faces->len; i++) {
-            int x1 = (int)faces->box[i].box_p[0];
-            int y1 = (int)faces->box[i].box_p[1];
-            int x2 = (int)faces->box[i].box_p[2];
-            int y2 = (int)faces->box[i].box_p[3];
-            float score = faces->score[i];
+    if(faces && faces->len > 0) {
+        for(int i=0; i<faces->len; i++) {
+            int x1=(int)faces->box[i].box_p[0];
+            int y1=(int)faces->box[i].box_p[1];
+            int x2=(int)faces->box[i].box_p[2];
+            int y2=(int)faces->box[i].box_p[3];
 
-            int lx[5], ly[5];
-            for (int j = 0; j < 5; j++) {
-                lx[j] = (int)faces->landmark[i].landmark_p[j*2];
-                ly[j] = (int)faces->landmark[i].landmark_p[j*2 + 1];
+            // --- lấy embedding ---
+            float embedding[FACE_ID_SIZE];
+            int face_id_value = -1; // mặc định chưa enroll
+
+            dl_matrix3du_t *aligned_face = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
+            if(aligned_face && align_face(faces, image_matrix, aligned_face) == ESP_OK) {
+                dl_matrix3d_t *face_id = get_face_id(aligned_face);
+                if(face_id) {
+                    memcpy(embedding, face_id->item, sizeof(float)*FACE_ID_SIZE);
+                    dl_matrix3d_free(face_id);
+                }
             }
+            if(aligned_face) dl_matrix3du_free(aligned_face);
 
-            dl_matrix3du_t *aligned_face = aligned_face_alloc();
-            if (!aligned_face) continue;
-            if (align_face2((fptp_t*)&faces->landmark[i], image_matrix, aligned_face) != ESP_OK) {
-                dl_matrix3du_free(aligned_face);
-                continue;
-            }
-
-            dl_matrix3d_t *face_id = get_face_id(aligned_face);
-            dl_matrix3du_free(aligned_face);
-
-            n = snprintf(p, rem,
-                "{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"score\":%.3f,"
-                "\"landmarks\":[[%d,%d],[%d,%d],[%d,%d],[%d,%d],[%d,%d]],"
-                "\"embedding\":[",
-                x1, y1, x2 - x1, y2 - y1, score,
-                lx[0], ly[0], lx[1], ly[1], lx[2], ly[2], lx[3], ly[3], lx[4], ly[4]);
-            if (n < 0 || (size_t)n >= rem) { dl_matrix3d_free(face_id); break; }
+            n = snprintf(p, rem, "{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"id\":%d,\"embedding\":[", x1, y1, x2-x1, y2-y1, face_id_value);
             p += n; rem -= n;
 
-            for (int k = 0; k < FACE_ID_SIZE; k++) {
-                float val = *((float*)face_id->item + k);
-                n = snprintf(p, rem, "%.6f%s", val, (k == FACE_ID_SIZE-1 ? "" : ","));
-                if (n < 0 || (size_t)n >= rem) break;
+            for(int k=0; k<FACE_ID_SIZE; k++){
+                n = snprintf(p, rem, "%.6f%s", embedding[k], (k==FACE_ID_SIZE-1?"":","));
                 p += n; rem -= n;
             }
-            dl_matrix3d_free(face_id);
-
-            n = snprintf(p, rem, "]}%s", (i == faces->len -1 ? "" : ","));
-            if (n < 0 || (size_t)n >= rem) break;
+            n = snprintf(p, rem, "]}%s", (i==faces->len-1?"":","));
             p += n; rem -= n;
         }
 
-        free(faces->score);
-        free(faces->box);
-        free(faces->landmark);
-        free(faces);
+        free(faces->score); free(faces->box); free(faces->landmark); free(faces);
     }
 
-    n = snprintf(p, rem, "]}");
-    p += n;
+    n = snprintf(p, rem, "],\"width\":%d,\"height\":%d}", fb->width, fb->height);
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req,"application/json");
+    httpd_resp_set_hdr(req,"Access-Control-Allow-Origin","*");
     esp_err_t res = httpd_resp_send(req, json, strlen(json));
-
     free(json);
     dl_matrix3du_free(image_matrix);
     return res;
 }
 
-// Pin relay mở cửa
-#define RELAY_PIN 13  
-
 // Mở cửa
 static esp_err_t open_door_handler(httpd_req_t *req) {
+    Serial.println("Opening door...");
     digitalWrite(RELAY_PIN, HIGH);   // bật relay
     delay(500);                       // giữ nửa giây
     digitalWrite(RELAY_PIN, LOW);    // tắt relay
+    Serial.println("Door opened");
+    
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, "{\"status\":\"door_opened\"}", -1);
 }
 
-// Enroll mặt hiện tại
-// Enroll mặt hiện tại
 static esp_err_t enroll_face_handler(httpd_req_t *req) {
-    camera_fb_t * fb = esp_camera_fb_get();
+    esp_task_wdt_reset();  // ADDED: Reset watchdog
+    
+    camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
+        Serial.println("Camera FB get failed");
+        return httpd_resp_send_500(req);
     }
 
     dl_matrix3du_t *image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
     if (!image_matrix) {
         esp_camera_fb_return(fb);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
+        Serial.println("Image matrix alloc failed");
+        return httpd_resp_send_500(req);
     }
 
     if (!fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item)) {
         dl_matrix3du_free(image_matrix);
         esp_camera_fb_return(fb);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
+        Serial.println("RGB conversion failed");
+        return httpd_resp_send_500(req);
     }
     esp_camera_fb_return(fb);
 
+    esp_task_wdt_reset();  // ADDED: Reset before detection
     box_array_t *faces = face_detect(image_matrix, &mtmn_config);
-    int8_t enrolled_id = -1;
+    int enrolled_id = -1;
 
     if (faces && faces->len > 0) {
-        // Chỉ enroll khuôn mặt đầu tiên
-        dl_matrix3du_t *aligned_face = aligned_face_alloc();
+        esp_task_wdt_reset();  // ADDED: Reset after detection
+        
+        dl_matrix3du_t *aligned_face = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
         if (aligned_face) {
-            if (align_face2((fptp_t*)&faces->landmark[0], image_matrix, aligned_face) == ESP_OK) {
-                // enroll vào flash
-                enrolled_id = enroll_face_id_to_flash(&id_list, aligned_face);
+            if (align_face(faces, image_matrix, aligned_face) == ESP_OK) {
+                dl_matrix3d_t *face_id = get_face_id(aligned_face);
+                if (face_id) {
+                    // --- tạo JSON embedding ---
+                    const size_t JSON_BUF_SZ = 4096;
+                    char *json_buf = (char*)malloc(JSON_BUF_SZ);
+                    if (json_buf) {
+                        char *p = json_buf;
+                        int rem = JSON_BUF_SZ;
+                        int n = snprintf(p, rem, "{\"embedding\":[");
+                        p += n; rem -= n;
+                        for (int i = 0; i < FACE_ID_SIZE; i++) {
+                            n = snprintf(p, rem, "%.6f%s", ((float*)face_id->item)[i], (i==FACE_ID_SIZE-1?"":","));
+                            p += n; rem -= n;
+                        }
+                        n = snprintf(p, rem, "]}");
+
+                        esp_task_wdt_reset();  // ADDED: Reset before HTTP request
+
+                        // --- gửi POST lên server (WITH TIMEOUT) ---
+                        esp_http_client_config_t config = {};
+                        config.url = "http://192.168.0.103:3000/enroll_face";
+                        config.method = HTTP_METHOD_POST;
+                        config.timeout_ms = 5000;  // ADDED: 5 second timeout
+
+                        esp_http_client_handle_t client = esp_http_client_init(&config);
+                        if (client) {
+                            esp_http_client_set_header(client, "Content-Type", "application/json");
+                            esp_http_client_set_post_field(client, json_buf, strlen(json_buf));
+
+                            esp_err_t err = esp_http_client_perform(client);
+                            if (err == ESP_OK) {
+                                int status_code = esp_http_client_get_status_code(client);
+                                Serial.printf("HTTP POST Status: %d\n", status_code);
+                                
+                                if (status_code == 200) {
+                                    char resp_buf[512];
+                                    int content_length = esp_http_client_get_content_length(client);
+                                    if (content_length > 0 && content_length < (int)sizeof(resp_buf)) {
+                                        int total_read = 0;
+                                        while (total_read < content_length) {
+                                            int read_len = esp_http_client_read(client, resp_buf + total_read, content_length - total_read);
+                                            if (read_len <= 0) break;
+                                            total_read += read_len;
+                                        }
+                                        resp_buf[total_read] = 0;
+                                        sscanf(resp_buf, "{\"status\":\"%*[^\\\"]\",\"id\":%d}", &enrolled_id);
+                                        Serial.printf("Enrolled with ID: %d\n", enrolled_id);
+                                    }
+                                }
+                            } else {
+                                Serial.printf("HTTP POST failed: %s\n", esp_err_to_name(err));
+                            }
+                            esp_http_client_cleanup(client);
+                        } else {
+                            Serial.println("Failed to init HTTP client");
+                        }
+                        free(json_buf);
+                    } else {
+                        Serial.println("JSON buffer alloc failed");
+                    }
+                    dl_matrix3d_free(face_id);
+                }
             }
             dl_matrix3du_free(aligned_face);
         }
+    } else {
+        Serial.println("No face detected for enrollment");
     }
 
     if (faces) {
@@ -761,15 +819,78 @@ static esp_err_t enroll_face_handler(httpd_req_t *req) {
     }
     dl_matrix3du_free(image_matrix);
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "{\"status\":\"enrolled\",\"id\":%d}", enrolled_id);
+    // --- gửi kết quả về client ESP ---
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"status\":\"%s\",\"id\":%d}", 
+             enrolled_id >= 0 ? "enrolled" : "failed", enrolled_id);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, buf, strlen(buf));
 }
 
+// MODIFIED: Increased stack size and added error handling
+void face_post_task(void *pvParameter) {
+    face_embedding_t emb;
+    TickType_t xDelay = 100 / portTICK_PERIOD_MS;  // Delay between requests
+    
+    Serial.println("Face post task started");
+    
+    while (1) {
+        if (xQueueReceive(face_queue, &emb, portMAX_DELAY)) {
+            esp_task_wdt_reset();  // ADDED: Reset watchdog
+            
+            const size_t POST_BUF_SZ = 1024;
+            char *post_buf = (char*)malloc(POST_BUF_SZ);
+            if (!post_buf) {
+                Serial.println("Failed to allocate post buffer");
+                vTaskDelay(xDelay);
+                continue;
+            }
+            
+            char *p = post_buf;
+            int rem = POST_BUF_SZ;
+            int n = snprintf(p, rem, "{\"embedding\":[");
+            p += n; rem -= n;
+            for (int i = 0; i < FACE_ID_SIZE; i++) {
+                n = snprintf(p, rem, "%.6f%s", emb.embedding[i], (i==FACE_ID_SIZE-1?"":","));
+                p += n; rem -= n;
+            }
+            snprintf(p, rem, "]}");
+
+            esp_http_client_config_t config = {};
+            config.url = "http://192.168.0.103:3000/recognize_face";
+            config.method = HTTP_METHOD_POST;
+            config.timeout_ms = 3000;  // ADDED: 3 second timeout
+
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            if (client) {
+                esp_http_client_set_header(client, "Content-Type", "application/json");
+                esp_http_client_set_post_field(client, post_buf, strlen(post_buf));
+
+                esp_err_t err = esp_http_client_perform(client);
+                if (err == ESP_OK) {
+                    int status = esp_http_client_get_status_code(client);
+                    Serial.printf("Recognition POST status: %d\n", status);
+                } else {
+                    Serial.printf("Recognition POST failed: %s\n", esp_err_to_name(err));
+                }
+                esp_http_client_cleanup(client);
+            } else {
+                Serial.println("Failed to init HTTP client for recognition");
+            }
+            
+            free(post_buf);
+            vTaskDelay(xDelay);  // Prevent flooding
+        }
+    }
+}
+
 void startCameraServer(){
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.ctrl_port = 32768;
+    config.max_uri_handlers = 16;  // ADDED: Increase handler limit
+    config.stack_size = 8192;      // ADDED: Increase stack size
 
     // --- existing URIs ---
     httpd_uri_t index_uri = {
@@ -811,7 +932,7 @@ void startCameraServer(){
     httpd_uri_t face_info_uri = {
         .uri       = "/face_info",
         .method    = HTTP_GET,
-        .handler   = face_info_handler,  // <-- handler mới JSON
+        .handler   = face_info_handler,
         .user_ctx  = NULL
     };
 
@@ -831,9 +952,18 @@ void startCameraServer(){
 
     ra_filter_init(&ra_filter, 20);
 
+    // MODIFIED: Create queue with proper size
+    face_queue = xQueueCreate(10, sizeof(face_embedding_t)); // Increased from 5 to 10
+    if (!face_queue) {
+        Serial.println("Failed to create face queue");
+    }
+
+    // MODIFIED: Increased stack size from 4096 to 8192
+    xTaskCreate(face_post_task, "face_post_task", 8192, NULL, 5, NULL);
+
     // --- mtmn config & face ID init ---
     mtmn_config.type = FAST;
-    mtmn_config.min_face = 80;
+    mtmn_config.min_face = 60;
     mtmn_config.pyramid = 0.707;
     mtmn_config.pyramid_times = 4;
     mtmn_config.p_threshold.score = 0.6;
@@ -855,13 +985,12 @@ void startCameraServer(){
         httpd_register_uri_handler(camera_httpd, &cmd_uri);
         httpd_register_uri_handler(camera_httpd, &status_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
-
-        // --- register new face info handler ---
         httpd_register_uri_handler(camera_httpd, &face_info_uri);
-        // door open
         httpd_register_uri_handler(camera_httpd, &open_door_uri);
-        // enroll face
         httpd_register_uri_handler(camera_httpd, &enroll_face_uri);
+        Serial.println("Camera HTTP server started successfully");
+    } else {
+        Serial.println("Failed to start camera HTTP server");
     }
 
     // --- start stream server ---
@@ -870,5 +999,11 @@ void startCameraServer(){
     Serial.printf("Starting stream server on port: '%d'\n", config.server_port);
     if (httpd_start(&stream_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(stream_httpd, &stream_uri);
+        Serial.println("Stream HTTP server started successfully");
+    } else {
+        Serial.println("Failed to start stream HTTP server");
     }
+    
+    Serial.printf("Free heap after server start: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("Free PSRAM after server start: %d bytes\n", ESP.getFreePsram());
 }
