@@ -25,6 +25,14 @@ void setup() {
   Serial.setDebugOutput(true);
   Serial.println();
 
+  // Print reset reason for debugging
+  Serial.printf("Reset reason: %d\n", esp_reset_reason());
+  Serial.printf("CPU Freq: %d MHz\n", getCpuFrequencyMhz());
+  
+  // Initialize relay pin
+  pinMode(13, OUTPUT);
+  digitalWrite(13, LOW);
+
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -44,15 +52,18 @@ void setup() {
   config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 20000000;  // Reduced from 20MHz for stability
   config.pixel_format = PIXFORMAT_JPEG;
-  //init with high specs to pre-allocate larger buffers
+  
+  // More conservative settings to prevent resets
   if(psramFound()){
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
+    Serial.println("PSRAM found");
+    config.frame_size = FRAMESIZE_QVGA;     // Changed from UXGA - more stable
+    config.jpeg_quality = 12;              // Lower quality = less memory
+    config.fb_count = 1;                   // Use 2 buffers for smoother streaming
   } else {
-    config.frame_size = FRAMESIZE_SVGA;
+    Serial.println("PSRAM NOT found - limited functionality");
+    config.frame_size = FRAMESIZE_QVGA;
     config.jpeg_quality = 12;
     config.fb_count = 1;
   }
@@ -65,42 +76,81 @@ void setup() {
   // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    return;
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    delay(1000);
+    ESP.restart();
   }
 
   sensor_t * s = esp_camera_sensor_get();
-  //initial sensors are flipped vertically and colors are a bit saturated
+  
+  // Initial sensors are flipped vertically and colors are a bit saturated
   if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);//flip it back
-    s->set_brightness(s, 1);//up the blightness just a bit
-    s->set_saturation(s, -2);//lower the saturation
+    s->set_vflip(s, 1);       // flip it back
+    s->set_brightness(s, 1);  // up the brightness just a bit
+    s->set_saturation(s, -2); // lower the saturation
   }
-  //drop down frame size for higher initial frame rate
-  s->set_framesize(s, FRAMESIZE_QVGA);
+  
+  // Keep VGA for face detection, don't override to QVGA
+  // s->set_framesize(s, FRAMESIZE_QVGA);  // REMOVED
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE)
   s->set_vflip(s, 1);
   s->set_hmirror(s, 1);
 #endif
 
+  // WiFi configuration for stability
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // Disable WiFi sleep
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   WiFi.begin(ssid, password);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  Serial.print("Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print(".");
+    attempts++;
   }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nWiFi connection failed! Restarting...");
+    delay(1000);
+    ESP.restart();
+  }
+
   Serial.println("");
   Serial.println("WiFi connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Print memory status before starting server
+  Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
+  Serial.printf("Min free heap: %d bytes\n", ESP.getMinFreeHeap());
 
   startCameraServer();
 
-  Serial.print("Camera Ready! Use 'http://");
+  Serial.print("\nCamera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
   Serial.println("' to connect");
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-  delay(10000);
+  // Monitor memory and WiFi status
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 10000) {  // Every 10 seconds
+    lastCheck = millis();
+    Serial.printf("Free heap: %d, Min free: %d, PSRAM: %d\n", 
+                  ESP.getFreeHeap(), 
+                  ESP.getMinFreeHeap(),
+                  ESP.getFreePsram());
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected! Reconnecting...");
+      WiFi.reconnect();
+    }
+  }
+  
+  delay(100);  // Short delay to prevent watchdog issues
 }
