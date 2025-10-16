@@ -629,38 +629,58 @@ static esp_err_t index_handler(httpd_req_t *req){
 
 // endpoint thông số khuôn mặt + nhận diện
 static esp_err_t face_info_handler(httpd_req_t *req) {
+    esp_task_wdt_reset();
+    
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) return httpd_resp_send_500(req);
 
     dl_matrix3du_t *image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
-    if (!image_matrix) { esp_camera_fb_return(fb); return httpd_resp_send_500(req); }
+    if (!image_matrix) { 
+        esp_camera_fb_return(fb); 
+        return httpd_resp_send_500(req); 
+    }
 
     if (!fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item)) {
-        dl_matrix3du_free(image_matrix); esp_camera_fb_return(fb); return httpd_resp_send_500(req);
+        dl_matrix3du_free(image_matrix); 
+        esp_camera_fb_return(fb); 
+        return httpd_resp_send_500(req);
     }
     esp_camera_fb_return(fb);
 
+    esp_task_wdt_reset();
     box_array_t *faces = face_detect(image_matrix, &mtmn_config);
 
-    const size_t JSON_BUF_SZ = 16384; // tăng buffer
+    const size_t JSON_BUF_SZ = 16384; // Increased buffer size
     char *json = (char*)malloc(JSON_BUF_SZ);
-    if (!json) { if(faces) free(faces->score); free(faces->box); free(faces->landmark); free(faces); dl_matrix3du_free(image_matrix); return httpd_resp_send_500(req); }
+    if (!json) { 
+        if(faces) { 
+            free(faces->score); 
+            free(faces->box); 
+            free(faces->landmark); 
+            free(faces); 
+        }
+        dl_matrix3du_free(image_matrix); 
+        return httpd_resp_send_500(req); 
+    }
 
-    char *p = json; size_t rem = JSON_BUF_SZ;
+    char *p = json; 
+    size_t rem = JSON_BUF_SZ;
     int n = snprintf(p, rem, "{\"faces\":[");
     p += n; rem -= n;
 
     if(faces && faces->len > 0) {
-        for(int i=0; i<faces->len; i++) {
-            int x1=(int)faces->box[i].box_p[0];
-            int y1=(int)faces->box[i].box_p[1];
-            int x2=(int)faces->box[i].box_p[2];
-            int y2=(int)faces->box[i].box_p[3];
+        esp_task_wdt_reset();
+        
+        for(int i = 0; i < faces->len; i++) {
+            int x1 = (int)faces->box[i].box_p[0];
+            int y1 = (int)faces->box[i].box_p[1];
+            int x2 = (int)faces->box[i].box_p[2];
+            int y2 = (int)faces->box[i].box_p[3];
 
-            // --- lấy embedding ---
+            // --- Get embedding for this face ---
             float embedding[FACE_ID_SIZE];
-            int face_id_value = -1; // mặc định chưa enroll
-
+            memset(embedding, 0, sizeof(embedding));
+            
             dl_matrix3du_t *aligned_face = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
             if(aligned_face && align_face(faces, image_matrix, aligned_face) == ESP_OK) {
                 dl_matrix3d_t *face_id = get_face_id(aligned_face);
@@ -671,25 +691,32 @@ static esp_err_t face_info_handler(httpd_req_t *req) {
             }
             if(aligned_face) dl_matrix3du_free(aligned_face);
 
-            n = snprintf(p, rem, "{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"id\":%d,\"embedding\":[", x1, y1, x2-x1, y2-y1, face_id_value);
+            // --- Build JSON with embedding included ---
+            n = snprintf(p, rem, "{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"id\":-1,\"embedding\":[", 
+                        x1, y1, x2-x1, y2-y1);
             p += n; rem -= n;
 
-            for(int k=0; k<FACE_ID_SIZE; k++){
+            for(int k = 0; k < FACE_ID_SIZE; k++){
                 n = snprintf(p, rem, "%.6f%s", embedding[k], (k==FACE_ID_SIZE-1?"":","));
                 p += n; rem -= n;
             }
+            
             n = snprintf(p, rem, "]}%s", (i==faces->len-1?"":","));
             p += n; rem -= n;
         }
 
-        free(faces->score); free(faces->box); free(faces->landmark); free(faces);
+        free(faces->score); 
+        free(faces->box); 
+        free(faces->landmark); 
+        free(faces);
     }
 
-    n = snprintf(p, rem, "],\"width\":%d,\"height\":%d}", fb->width, fb->height);
+    n = snprintf(p, rem, "]}");
 
     httpd_resp_set_type(req,"application/json");
     httpd_resp_set_hdr(req,"Access-Control-Allow-Origin","*");
     esp_err_t res = httpd_resp_send(req, json, strlen(json));
+    
     free(json);
     dl_matrix3du_free(image_matrix);
     return res;
