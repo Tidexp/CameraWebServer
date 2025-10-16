@@ -15,8 +15,8 @@
 
 #include "camera_pins.h"
 
-const char *ssid = "TP-Link_5944";
-const char *password = "21002373";
+const char *ssid = "nguyendole";
+const char *password = "00000000";
 
 void startCameraServer();
 
@@ -60,7 +60,7 @@ void setup() {
     Serial.println("PSRAM found");
     config.frame_size = FRAMESIZE_QVGA;     // Changed from UXGA - more stable
     config.jpeg_quality = 12;              // Lower quality = less memory
-    config.fb_count = 1;                   // Use 2 buffers for smoother streaming
+    config.fb_count = 2;                   // Use 2 buffers for smoother streaming
   } else {
     Serial.println("PSRAM NOT found - limited functionality");
     config.frame_size = FRAMESIZE_QVGA;
