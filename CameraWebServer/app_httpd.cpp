@@ -722,19 +722,6 @@ static esp_err_t face_info_handler(httpd_req_t *req) {
     return res;
 }
 
-// Mở cửa
-static esp_err_t open_door_handler(httpd_req_t *req) {
-    Serial.println("Opening door...");
-    digitalWrite(RELAY_PIN, HIGH);   // bật relay
-    delay(500);                       // giữ nửa giây
-    digitalWrite(RELAY_PIN, LOW);    // tắt relay
-    Serial.println("Door opened");
-    
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_send(req, "{\"status\":\"door_opened\"}", -1);
-}
-
 static esp_err_t enroll_face_handler(httpd_req_t *req) {
     esp_task_wdt_reset();  // ADDED: Reset watchdog
     
@@ -855,59 +842,82 @@ static esp_err_t enroll_face_handler(httpd_req_t *req) {
     return httpd_resp_send(req, buf, strlen(buf));
 }
 
-// MODIFIED: Increased stack size and added error handling
 void face_post_task(void *pvParameter) {
     face_embedding_t emb;
-    TickType_t xDelay = 100 / portTICK_PERIOD_MS;  // Delay between requests
-    
+    TickType_t xDelay = 100 / portTICK_PERIOD_MS;  
+
     Serial.println("Face post task started");
-    
+
     while (1) {
         if (xQueueReceive(face_queue, &emb, portMAX_DELAY)) {
-            esp_task_wdt_reset();  // ADDED: Reset watchdog
-            
-            const size_t POST_BUF_SZ = 1024;
-            char *post_buf = (char*)malloc(POST_BUF_SZ);
-            if (!post_buf) {
-                Serial.println("Failed to allocate post buffer");
+            esp_task_wdt_reset();  
+
+            // --- Build JSON payload ---
+            char post_buf[1024];
+            int len = snprintf(post_buf, sizeof(post_buf), "{\"embedding\":[");
+            for (int i = 0; i < FACE_ID_SIZE; i++) {
+                len += snprintf(post_buf + len, sizeof(post_buf) - len, "%.6f%s",
+                                emb.embedding[i], (i == FACE_ID_SIZE - 1 ? "" : ","));
+            }
+            snprintf(post_buf + len, sizeof(post_buf) - len, "]}");
+
+            // --- Recognition POST ---
+            esp_http_client_config_t config;
+            memset(&config, 0, sizeof(config));
+            config.url = "http://192.168.0.103:3000/recognize_face";
+            config.timeout_ms = 3000;
+
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            if (!client) {
+                Serial.println("Failed to init HTTP client for recognition");
                 vTaskDelay(xDelay);
                 continue;
             }
-            
-            char *p = post_buf;
-            int rem = POST_BUF_SZ;
-            int n = snprintf(p, rem, "{\"embedding\":[");
-            p += n; rem -= n;
-            for (int i = 0; i < FACE_ID_SIZE; i++) {
-                n = snprintf(p, rem, "%.6f%s", emb.embedding[i], (i==FACE_ID_SIZE-1?"":","));
-                p += n; rem -= n;
-            }
-            snprintf(p, rem, "]}");
 
-            esp_http_client_config_t config = {};
-            config.url = "http://192.168.0.103:3000/recognize_face";
-            config.method = HTTP_METHOD_POST;
-            config.timeout_ms = 3000;  // ADDED: 3 second timeout
+            esp_http_client_set_method(client, HTTP_METHOD_POST);
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            esp_http_client_set_post_field(client, post_buf, strlen(post_buf));
 
-            esp_http_client_handle_t client = esp_http_client_init(&config);
-            if (client) {
-                esp_http_client_set_header(client, "Content-Type", "application/json");
-                esp_http_client_set_post_field(client, post_buf, strlen(post_buf));
+            esp_err_t err = esp_http_client_perform(client);
+            if (err == ESP_OK) {
+                int status = esp_http_client_get_status_code(client);
+                Serial.printf("Recognition POST status: %d\n", status);
 
-                esp_err_t err = esp_http_client_perform(client);
-                if (err == ESP_OK) {
-                    int status = esp_http_client_get_status_code(client);
-                    Serial.printf("Recognition POST status: %d\n", status);
-                } else {
-                    Serial.printf("Recognition POST failed: %s\n", esp_err_to_name(err));
+                if (status == 200) {
+                    char resp_buf[512];
+                    int len2 = esp_http_client_read(client, resp_buf, sizeof(resp_buf) - 1);
+                    if (len2 > 0) {
+                        resp_buf[len2] = '\0';
+                        if (strstr(resp_buf, "\"recognized\":true")) {
+                            Serial.println("✅ Face recognized, triggering door...");
+
+                            // --- Trigger door ESP ---
+                            esp_http_client_config_t door_config;
+                            memset(&door_config, 0, sizeof(door_config));
+                            door_config.url = "http://192.168.0.105/open_door";
+                            door_config.timeout_ms = 3000;
+
+                            esp_http_client_handle_t door_client = esp_http_client_init(&door_config);
+                            if (door_client) {
+                                esp_http_client_set_method(door_client, HTTP_METHOD_GET);
+                                esp_err_t err2 = esp_http_client_perform(door_client);
+                                if (err2 == ESP_OK)
+                                    Serial.println("🚪 Door trigger sent to ESP2");
+                                else
+                                    Serial.printf("❌ Door trigger failed: %s\n", esp_err_to_name(err2));
+                                esp_http_client_cleanup(door_client);
+                            }
+                        } else {
+                            Serial.println("😶 Face not recognized.");
+                        }
+                    }
                 }
-                esp_http_client_cleanup(client);
             } else {
-                Serial.println("Failed to init HTTP client for recognition");
+                Serial.printf("Recognition POST failed: %s\n", esp_err_to_name(err));
             }
-            
-            free(post_buf);
-            vTaskDelay(xDelay);  // Prevent flooding
+
+            esp_http_client_cleanup(client);
+            vTaskDelay(xDelay);  
         }
     }
 }
@@ -963,16 +973,9 @@ void startCameraServer(){
         .user_ctx  = NULL
     };
 
-    httpd_uri_t open_door_uri = {
-        .uri = "/open_door",
-        .method = HTTP_GET,
-        .handler = open_door_handler,
-        .user_ctx = NULL
-    };
-
     httpd_uri_t enroll_face_uri = {
         .uri = "/enroll_face",
-        .method = HTTP_GET,
+        .method = HTTP_POST,
         .handler = enroll_face_handler,
         .user_ctx = NULL
     };
@@ -990,7 +993,7 @@ void startCameraServer(){
 
     // --- mtmn config & face ID init ---
     mtmn_config.type = FAST;
-    mtmn_config.min_face = 60;
+    mtmn_config.min_face = 80;
     mtmn_config.pyramid = 0.707;
     mtmn_config.pyramid_times = 4;
     mtmn_config.p_threshold.score = 0.6;
@@ -1013,7 +1016,6 @@ void startCameraServer(){
         httpd_register_uri_handler(camera_httpd, &status_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
         httpd_register_uri_handler(camera_httpd, &face_info_uri);
-        httpd_register_uri_handler(camera_httpd, &open_door_uri);
         httpd_register_uri_handler(camera_httpd, &enroll_face_uri);
         Serial.println("Camera HTTP server started successfully");
     } else {
