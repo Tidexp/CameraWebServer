@@ -650,7 +650,7 @@ static esp_err_t face_info_handler(httpd_req_t *req) {
     esp_task_wdt_reset();
     box_array_t *faces = face_detect(image_matrix, &mtmn_config);
 
-    const size_t JSON_BUF_SZ = 16384; // Increased buffer size
+    const size_t JSON_BUF_SZ = 16384;
     char *json = (char*)malloc(JSON_BUF_SZ);
     if (!json) { 
         if(faces) { 
@@ -682,14 +682,23 @@ static esp_err_t face_info_handler(httpd_req_t *req) {
             memset(embedding, 0, sizeof(embedding));
             
             dl_matrix3du_t *aligned_face = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
-            if(aligned_face && align_face(faces, image_matrix, aligned_face) == ESP_OK) {
-                dl_matrix3d_t *face_id = get_face_id(aligned_face);
-                if(face_id) {
-                    memcpy(embedding, face_id->item, sizeof(float)*FACE_ID_SIZE);
-                    dl_matrix3d_free(face_id);
+            if(aligned_face) {
+                // FIXED: Create a temporary box_array_t for the single face
+                box_array_t single_face = {0};
+                single_face.len = 1;
+                single_face.box = &faces->box[i];
+                single_face.landmark = &faces->landmark[i];
+                single_face.score = &faces->score[i];
+                
+                if(align_face(&single_face, image_matrix, aligned_face) == ESP_OK) {
+                    dl_matrix3d_t *face_id = get_face_id(aligned_face);
+                    if(face_id) {
+                        memcpy(embedding, face_id->item, sizeof(float)*FACE_ID_SIZE);
+                        dl_matrix3d_free(face_id);
+                    }
                 }
+                dl_matrix3du_free(aligned_face);
             }
-            if(aligned_face) dl_matrix3du_free(aligned_face);
 
             // --- Build JSON with embedding included ---
             n = snprintf(p, rem, "{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"id\":-1,\"embedding\":[", 
@@ -697,7 +706,7 @@ static esp_err_t face_info_handler(httpd_req_t *req) {
             p += n; rem -= n;
 
             for(int k = 0; k < FACE_ID_SIZE; k++){
-                n = snprintf(p, rem, "%.6f%s", embedding[k], (k==FACE_ID_SIZE-1?"":","));
+                n = snprintf(p, rem, "%.8f%s", embedding[k], (k==FACE_ID_SIZE-1?"":","));
                 p += n; rem -= n;
             }
             
@@ -751,11 +760,19 @@ static esp_err_t enroll_face_handler(httpd_req_t *req) {
     int enrolled_id = -1;
 
     if (faces && faces->len > 0) {
-        esp_task_wdt_reset();  // ADDED: Reset after detection
+        esp_task_wdt_reset();
         
+        // Use only the first (most confident) face
         dl_matrix3du_t *aligned_face = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
         if (aligned_face) {
-            if (align_face(faces, image_matrix, aligned_face) == ESP_OK) {
+            // FIXED: Create temporary box_array_t for consistency with face_info_handler
+            box_array_t single_face = {0};
+            single_face.len = 1;
+            single_face.box = &faces->box[0];  // Only first face
+            single_face.landmark = &faces->landmark[0];
+            single_face.score = &faces->score[0];
+            
+            if (align_face(&single_face, image_matrix, aligned_face) == ESP_OK) {
                 dl_matrix3d_t *face_id = get_face_id(aligned_face);
                 if (face_id) {
                     // --- tạo JSON embedding ---
@@ -766,19 +783,21 @@ static esp_err_t enroll_face_handler(httpd_req_t *req) {
                         int rem = JSON_BUF_SZ;
                         int n = snprintf(p, rem, "{\"embedding\":[");
                         p += n; rem -= n;
+                        
                         for (int i = 0; i < FACE_ID_SIZE; i++) {
-                            n = snprintf(p, rem, "%.6f%s", ((float*)face_id->item)[i], (i==FACE_ID_SIZE-1?"":","));
+                            float val = ((float*)face_id->item)[i];
+                            n = snprintf(p, rem, "%.8f%s", val, (i==FACE_ID_SIZE-1?"":","));
                             p += n; rem -= n;
                         }
                         n = snprintf(p, rem, "]}");
 
-                        esp_task_wdt_reset();  // ADDED: Reset before HTTP request
+                        esp_task_wdt_reset();
 
-                        // --- gửi POST lên server (WITH TIMEOUT) ---
+                        // --- gửi POST lên server ---
                         esp_http_client_config_t config = {};
                         config.url = "http://192.168.0.103:3000/enroll_face";
                         config.method = HTTP_METHOD_POST;
-                        config.timeout_ms = 5000;  // ADDED: 5 second timeout
+                        config.timeout_ms = 5000;
 
                         esp_http_client_handle_t client = esp_http_client_init(&config);
                         if (client) {
@@ -809,15 +828,13 @@ static esp_err_t enroll_face_handler(httpd_req_t *req) {
                                 Serial.printf("HTTP POST failed: %s\n", esp_err_to_name(err));
                             }
                             esp_http_client_cleanup(client);
-                        } else {
-                            Serial.println("Failed to init HTTP client");
                         }
                         free(json_buf);
-                    } else {
-                        Serial.println("JSON buffer alloc failed");
                     }
                     dl_matrix3d_free(face_id);
                 }
+            } else {
+                Serial.println("Face alignment failed");
             }
             dl_matrix3du_free(aligned_face);
         }
@@ -856,7 +873,7 @@ void face_post_task(void *pvParameter) {
             char post_buf[1024];
             int len = snprintf(post_buf, sizeof(post_buf), "{\"embedding\":[");
             for (int i = 0; i < FACE_ID_SIZE; i++) {
-                len += snprintf(post_buf + len, sizeof(post_buf) - len, "%.6f%s",
+                len += snprintf(post_buf + len, sizeof(post_buf) - len, "%.8f%s",
                                 emb.embedding[i], (i == FACE_ID_SIZE - 1 ? "" : ","));
             }
             snprintf(post_buf + len, sizeof(post_buf) - len, "]}");
