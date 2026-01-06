@@ -39,7 +39,8 @@ int ledPin = 4;             // Chân LED báo hiệu PIR
 // --------- SENSOR CONFIG (NEW) ---------
 #define DHT_PIN 27          // Chân dữ liệu DHT11
 #define DHT_TYPE DHT11      // Loại cảm biến
-#define SERVER_IP "172.27.136.93"   // IP Server nhận dữ liệu
+#define SERVER_IP "192.168.1.20"   // IP Server nhận dữ liệu
+
 #define SERVER_PORT 3000            // Cổng Server
 
 // ----------------- Biến -----------------
@@ -64,13 +65,22 @@ const unsigned long SENSOR_SEND_INTERVAL = 5000; // Chu kỳ gửi dữ liệu (
 
 // --------- SENSOR SENDING FUNCTION (NEW) ---------
 void sendSensorData() {
-    // Đọc dữ liệu từ DHT11, MQ2 và PIR
+    Serial.println("\n--- SENSOR LOG START ---");
+
     float humidity = dht.readHumidity();
     float temperature = dht.readTemperature();
     int gasLevel = analogRead(GAS_PIN);
     bool motionDetected = digitalRead(pirPin) == HIGH;
 
-    // Xây dựng payload JSON
+    Serial.printf("Temp đọc được: %.2f°C\n", temperature);
+    Serial.printf("Humidity đọc được: %.2f%%\n", humidity);
+    Serial.printf("Gas đọc được: %d\n", gasLevel);
+    Serial.printf("Motion: %s\n", motionDetected ? "true" : "false");
+
+    if (isnan(humidity) || isnan(temperature)) {
+        Serial.println("Lỗi đọc DHT");
+    }
+
     char jsonPayload[256];
     snprintf(jsonPayload, sizeof(jsonPayload),
         "{\"temperature\":%.2f,\"humidity\":%.2f,\"gasLevel\":%d,\"motionDetected\":%s}",
@@ -80,30 +90,47 @@ void sendSensorData() {
         motionDetected ? "true" : "false"
     );
 
-    // Cấu hình HTTP client và gửi POST request
+    Serial.print("Payload JSON: ");
+    Serial.println(jsonPayload);
+
+    // Log WiFi status
+    Serial.print("WiFi status: ");
+    Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "NOT CONNECTED");
+    Serial.print("ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+
     esp_http_client_config_t config = {};
-    config.host = SERVER_IP;
-    config.port = SERVER_PORT;
-    config.path = "/sensor_data";
+    config.url = "http://dung lenh ipconfig de dan ipv4 vao day:3000/sensor_data";
     config.method = HTTP_METHOD_POST;
     config.timeout_ms = 5000;
+    config.transport_type = HTTP_TRANSPORT_OVER_TCP;
+
+    Serial.print("Đang POST tới server: ");
+    Serial.println(config.url);
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return;
+    if (!client) {
+        Serial.println("HTTP client init failed");
+        Serial.println("--- SENSOR LOG END ---\n");
+        return;
+    }
 
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, jsonPayload, strlen(jsonPayload));
 
+    Serial.println("Bắt đầu gửi request...");
     esp_err_t err = esp_http_client_perform(client);
 
     if (err == ESP_OK) {
         int status_code = esp_http_client_get_status_code(client);
-        Serial.printf("✓ Sensor sent (Status: %d) | Temp: %.1f°C, Humidity: %.1f%%, Gas: %d, Motion: %s\n",
-            status_code, temperature, humidity, gasLevel, motionDetected ? "Yes" : "No");
+        Serial.printf("Gửi thành công (Status %d)\n", status_code);
     } else {
-        Serial.printf("✗ Sensor send failed: %s\n", esp_err_to_name(err));
+        Serial.print("Gửi thất bại: ");
+        Serial.println(esp_err_to_name(err));
     }
+
     esp_http_client_cleanup(client);
+    Serial.println("--- SENSOR LOG END ---\n");
 }
 
 // ----------------- Hàm xử lý SinricPro -----------------
@@ -153,6 +180,16 @@ void setup() {
     // Cấu hình Servo
     doorServoGas.attach(SERVO_GAS_PIN); doorServoGas.write(0);
     doorServoRFID.attach(SERVO_RFID_PIN); doorServoRFID.write(0);
+
+    IPAddress local_IP(192, 168, 1, 50);    // IP cho ESP32 (đổi số cuối tuỳ thích)
+    IPAddress gateway(192, 168, 1, 1);      // IP router (đa số là .1)
+    IPAddress subnet(255, 255, 255, 0);
+    IPAddress primaryDNS(8, 8, 8, 8);       // DNS
+    IPAddress secondaryDNS(8, 8, 4, 4);
+
+    if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+        Serial.println("⚠️ Set IP tĩnh thất bại, DHCP fallback");
+    }
 
     // Kết nối WiFi
     WiFi.begin(ssid, password);
