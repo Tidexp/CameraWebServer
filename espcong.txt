@@ -1,0 +1,186 @@
+#include <WiFi.h>              // Thư viện quản lý kết nối WiFi
+#include <esp_http_server.h>   // Thư viện tạo máy chủ HTTP trên ESP32
+#include <ESP32Servo.h>        // Thư viện điều khiển Servo
+
+// ================== WiFi ==================
+const char* ssid = "";    // Tên mạng WiFi
+const char* password = "";  // Mật khẩu WiFi
+
+// ================== Servo mở cửa ==================
+#define SERVO_PIN_1 13         // Chân điều khiển Servo 1
+#define SERVO_PIN_2 12         // Chân điều khiển Servo 2
+#define UNLOCK_DURATION 2000   // Thời gian mở cửa (ms)
+
+Servo servo1;                  // Đối tượng Servo 1
+Servo servo2;                  // Đối tượng Servo 2
+
+// ================== L298N Motor Driver ==================
+#define IN1 26                 // Chân điều khiển motor L298N (Chiều 1)
+#define IN2 25                 // Chân điều khiển motor L298N (Chiều 2)
+
+// ================== Cảm biến mưa ==================
+#define RAIN_SENSOR_PIN 34     // Chân Analog/Digital đọc tín hiệu cảm biến mưa
+
+// Trạng thái giàn phơi
+bool roofIsRetracted = false; // true = đã kéo vào, false = đã kéo ra
+
+// ================== HTTP server handle ==================
+httpd_handle_t server = NULL; // Biến xử lý cho máy chủ HTTP
+
+// ================== Hàm mở cửa ==================
+void triggerDoor() {
+    Serial.println("🚪 Mở 2 servo...");
+    servo1.write(90);  // Mở Servo
+    servo2.write(90);
+    delay(UNLOCK_DURATION);
+    servo1.write(0);   // Đóng Servo
+    servo2.write(0);
+    Serial.println("✓ Cửa đã đóng lại");
+}
+
+// ================== Hàm điều khiển giàn phơi ==================
+void retractRoof() {
+    if (!roofIsRetracted) {
+        Serial.println("🌧️ Mưa - Kéo giàn phơi vào...");
+        digitalWrite(IN1, HIGH); // Kích hoạt motor kéo vào
+        digitalWrite(IN2, LOW);
+        delay(5000);             // Thời gian kéo vào
+        digitalWrite(IN1, LOW);  // Dừng motor
+        digitalWrite(IN2, LOW);
+        roofIsRetracted = true;
+        Serial.println("✅ Giàn phơi đã kéo vào");
+    }
+}
+
+void extendRoof() {
+    if (roofIsRetracted) {
+        Serial.println("☀️ Tạnh mưa - Kéo giàn phơi ra...");
+        digitalWrite(IN1, LOW);
+        digitalWrite(IN2, HIGH); // Kích hoạt motor kéo ra
+        delay(5000);             // Thời gian kéo ra
+        digitalWrite(IN1, LOW);  // Dừng motor
+        digitalWrite(IN2, LOW);
+        roofIsRetracted = false;
+        Serial.println("✅ Giàn phơi đã kéo ra");
+    }
+}
+
+// ================== HTTP handlers ==================
+// Xử lý yêu cầu mở cửa qua HTTP
+static esp_err_t open_door_handler(httpd_req_t *req) {
+    Serial.println("📨 Nhận yêu cầu mở cửa");
+    triggerDoor(); // Gọi hàm mở cửa
+    const char response[] = "door_opened";
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, response, strlen(response));
+}
+
+// Xử lý yêu cầu lấy trạng thái thiết bị
+static esp_err_t status_handler(httpd_req_t *req) {
+    const char response[] = "{\"status\":\"door_esp_online\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, response, strlen(response));
+}
+
+// ================== WiFi ==================
+void initWiFi() {
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n✓ WiFi connected!");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\n✗ Failed to connect to WiFi");
+    }
+}
+
+// ================== HTTP Server ==================
+void startServer() {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG(); // Cấu hình server mặc định
+    config.server_port = 80;
+
+    Serial.printf("Starting HTTP server on port %d\n", config.server_port);
+
+    if (httpd_start(&server, &config) != ESP_OK) {
+        Serial.println("Failed to start server");
+        return;
+    }
+
+    // Định nghĩa và đăng ký URI cho lệnh mở cửa
+    httpd_uri_t open_door_uri = {
+        .uri = "/open_door",
+        .method = HTTP_GET,
+        .handler = open_door_handler,
+        .user_ctx = NULL};
+
+    // Định nghĩa và đăng ký URI cho trạng thái
+    httpd_uri_t status_uri = {
+        .uri = "/status",
+        .method = HTTP_GET,
+        .handler = status_handler,
+        .user_ctx = NULL};
+
+    httpd_register_uri_handler(server, &open_door_uri);
+    httpd_register_uri_handler(server, &status_uri);
+
+    Serial.println("✓ HTTP server started successfully");
+    Serial.println("Endpoints:");
+    Serial.println("  GET /open_door  - Mở cửa");
+    Serial.println("  GET /status     - Trạng thái");
+}
+
+// ================== SETUP ==================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("\n=== ESP32 Smart Door + Rain System ===");
+
+    // Cấu hình Servo
+    servo1.attach(SERVO_PIN_1); servo1.write(0);
+    servo2.attach(SERVO_PIN_2); servo2.write(0);
+
+    // Cấu hình Motor (L298N)
+    pinMode(IN1, OUTPUT); digitalWrite(IN1, LOW);
+    pinMode(IN2, OUTPUT); digitalWrite(IN2, LOW);
+
+    // Cấu hình cảm biến mưa
+    pinMode(RAIN_SENSOR_PIN, INPUT);
+
+    // Khởi tạo WiFi và Server
+    initWiFi();
+    delay(1000);
+    startServer();
+
+    Serial.println("=== Setup Complete ===\n");
+}
+
+// ================== LOOP ==================
+void loop() {
+    // Kiểm tra và kết nối lại WiFi nếu mất kết nối
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected, reconnecting...");
+        WiFi.reconnect();
+    }
+
+    // Đọc cảm biến mưa
+    int rainValue = digitalRead(RAIN_SENSOR_PIN);
+
+    if (rainValue == LOW) { // Nếu trời mưa
+        retractRoof(); // Kéo giàn phơi vào
+    } else { // Nếu trời tạnh
+        extendRoof();  // Kéo giàn phơi ra
+    }
+
+    delay(3000); // Kiểm tra mỗi 3 giây
+}

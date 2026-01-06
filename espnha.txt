@@ -1,0 +1,257 @@
+#include <WiFi.h>              // Quản lý kết nối WiFi
+#include <SinricPro.h>         // Giao tiếp với nền tảng IoT SinricPro
+#include <SinricProSwitch.h>   // Hỗ trợ thiết bị kiểu công tắc SinricPro
+#include <ESP32Servo.h>        // Điều khiển động cơ Servo
+#include <SPI.h>               // Giao tiếp SPI
+#include <MFRC522.h>           // Giao tiếp với module RFID-RC522
+#include <esp_http_client.h>   // Gửi dữ liệu qua HTTP (cho Sensor)
+#include <DHT.h>               // Cảm biến nhiệt độ và độ ẩm DHT
+
+// ----------------- WiFi -----------------
+const char *ssid = "";    // Tên mạng WiFi
+const char *password = "";  // Mật khẩu WiFi
+
+// ----------------- SinricPro -----------------
+#define APP_KEY "8ae2d869-bd22-4b97-91f1-b8f324c4bd4e"
+#define APP_SECRET "f0435137-df3f-42f6-b8b7-d854de746a9a-b35c99e8-73e9-4701-aa61-000edf084d8a"
+#define SWITCH1_ID "68ba7d56690df7312159f46e"  // ID Quạt khách
+#define SWITCH2_ID "68ba7937690df7312159f2fc"  // ID Đèn khách
+#define SWITCH3_ID "68d63e9dc6b3a7ebd1b51a13"  // ID Đèn ngủ
+
+// ----------------- Chân thiết bị -----------------
+#define FAN_PIN 13          // Chân điều khiển Quạt
+#define LIGHT1_PIN 15       // Chân điều khiển Đèn khách
+#define LIGHT2_PIN 12       // Chân điều khiển Đèn ngủ
+#define GAS_PIN 34          // Chân Analog Gas MQ-2
+#define SERVO_GAS_PIN 14    // Chân Servo van Gas
+#define BUZZER_PIN 25       // Chân Còi báo động
+#define FAN_ALARM_PIN 26    // Chân Quạt hút khi báo động
+
+#define RFID_SDA 5          // Chân Chip Select/SDA RFID
+#define RFID_SCK 18         // Chân Clock RFID
+#define RFID_MOSI 23        // Chân MOSI RFID
+#define RFID_MISO 19        // Chân MISO RFID
+#define RFID_RST 33         // Chân Reset RFID
+#define SERVO_RFID_PIN 32   // Chân Servo mở khóa RFID
+int pirPin = 22;            // Chân tín hiệu cảm biến PIR
+int ledPin = 4;             // Chân LED báo hiệu PIR
+
+// --------- SENSOR CONFIG (NEW) ---------
+#define DHT_PIN 27          // Chân dữ liệu DHT11
+#define DHT_TYPE DHT11      // Loại cảm biến
+#define SERVER_IP "172.27.136.93"   // IP Server nhận dữ liệu
+#define SERVER_PORT 3000            // Cổng Server
+
+// ----------------- Biến -----------------
+Servo doorServoGas;   // Đối tượng Servo Gas
+Servo doorServoRFID;  // Đối tượng Servo RFID
+int gasThreshold = 1300; // Ngưỡng cảnh báo Gas
+bool gasAlarm = false;   // Cờ trạng thái báo động Gas
+
+// RFID
+MFRC522 mfrc522(RFID_SDA, RFID_RST); // Khởi tạo module RFID
+String validIDs[] = { "EE:15:FA:03", "D1:89:B2:7B" }; // Các ID thẻ hợp lệ
+
+// Trạng thái thiết bị
+bool fanState = false;
+bool light1State = false;
+bool light2State = false;
+
+// --------- SENSOR VARIABLES (NEW) ---------
+DHT dht(DHT_PIN, DHT_TYPE);             // Đối tượng cảm biến DHT
+unsigned long lastSensorSendTime = 0;   // Thời điểm gửi dữ liệu sensor cuối
+const unsigned long SENSOR_SEND_INTERVAL = 5000; // Chu kỳ gửi dữ liệu (5s)
+
+// --------- SENSOR SENDING FUNCTION (NEW) ---------
+void sendSensorData() {
+    // Đọc dữ liệu từ DHT11, MQ2 và PIR
+    float humidity = dht.readHumidity();
+    float temperature = dht.readTemperature();
+    int gasLevel = analogRead(GAS_PIN);
+    bool motionDetected = digitalRead(pirPin) == HIGH;
+
+    // Xây dựng payload JSON
+    char jsonPayload[256];
+    snprintf(jsonPayload, sizeof(jsonPayload),
+        "{\"temperature\":%.2f,\"humidity\":%.2f,\"gasLevel\":%d,\"motionDetected\":%s}",
+        temperature,
+        humidity,
+        gasLevel,
+        motionDetected ? "true" : "false"
+    );
+
+    // Cấu hình HTTP client và gửi POST request
+    esp_http_client_config_t config = {};
+    config.host = SERVER_IP;
+    config.port = SERVER_PORT;
+    config.path = "/sensor_data";
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 5000;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) return;
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, jsonPayload, strlen(jsonPayload));
+
+    esp_err_t err = esp_http_client_perform(client);
+
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        Serial.printf("✓ Sensor sent (Status: %d) | Temp: %.1f°C, Humidity: %.1f%%, Gas: %d, Motion: %s\n",
+            status_code, temperature, humidity, gasLevel, motionDetected ? "Yes" : "No");
+    } else {
+        Serial.printf("✗ Sensor send failed: %s\n", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+}
+
+// ----------------- Hàm xử lý SinricPro -----------------
+// Hàm callback xử lý lệnh Bật/Tắt (PowerState) từ SinricPro
+bool onPowerState(const String &deviceId, bool &state) {
+    if (deviceId == SWITCH1_ID) {
+      if (fanState != state) {
+        digitalWrite(FAN_PIN, state ? HIGH : LOW);
+        fanState = state;
+        Serial.printf("Quạt khách: %s\n", state ? "ON" : "OFF");
+      }
+    } else if (deviceId == SWITCH2_ID) {
+      if (light1State != state) {
+        digitalWrite(LIGHT1_PIN, state ? HIGH : LOW);
+        light1State = state;
+        Serial.printf("Đèn khách: %s\n", state ? "ON" : "OFF");
+      }
+    } else if (deviceId == SWITCH3_ID) {
+      if (light2State != state) {
+        digitalWrite(LIGHT2_PIN, state ? HIGH : LOW);
+        light2State = state;
+        Serial.printf("Đèn ngủ: %s\n", state ? "ON" : "OFF");
+      }
+    }
+    return true;
+}
+
+// ----------------- Setup -----------------
+void setup() {
+    // Khởi tạo Serial và chân thiết bị
+    pinMode(pirPin, INPUT);
+    pinMode(ledPin, OUTPUT);
+    Serial.begin(115200);
+    delay(1000);
+
+    dht.begin(); // Khởi tạo DHT
+    Serial.println("DHT sensor initialized");
+
+    // Cấu hình các chân điều khiển Relay và Alarm
+    pinMode(FAN_PIN, OUTPUT); digitalWrite(FAN_PIN, LOW);
+    pinMode(LIGHT1_PIN, OUTPUT); digitalWrite(LIGHT1_PIN, LOW);
+    pinMode(LIGHT2_PIN, OUTPUT); digitalWrite(LIGHT2_PIN, LOW);
+    pinMode(GAS_PIN, INPUT);
+    pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW);
+    pinMode(FAN_ALARM_PIN, OUTPUT); digitalWrite(FAN_ALARM_PIN, LOW);
+
+    // Cấu hình Servo
+    doorServoGas.attach(SERVO_GAS_PIN); doorServoGas.write(0);
+    doorServoRFID.attach(SERVO_RFID_PIN); doorServoRFID.write(0);
+
+    // Kết nối WiFi
+    WiFi.begin(ssid, password);
+    Serial.print("Đang kết nối WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("Đã kết nối");
+
+    // Khởi tạo SinricPro và gán hàm callback
+    SinricPro.begin(APP_KEY, APP_SECRET);
+    SinricProSwitch &fan = SinricPro[SWITCH1_ID];
+    SinricProSwitch &light1 = SinricPro[SWITCH2_ID];
+    SinricProSwitch &light2 = SinricPro[SWITCH3_ID];
+
+    fan.onPowerState(onPowerState);
+    light1.onPowerState(onPowerState);
+    light2.onPowerState(onPowerState);
+
+    SinricPro.onConnected([]() { Serial.println("Đã kết nối SinricPro"); });
+    SinricPro.onDisconnected([]() { Serial.println("Đã ngắt kết nối SinricPro"); });
+
+    // Khởi tạo RFID
+    SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SDA);
+    mfrc522.PCD_Init();
+    Serial.println("RFID ready");
+}
+
+// ----------------- Loop -----------------
+void loop() {
+    SinricPro.handle(); // Xử lý lệnh từ SinricPro
+
+    // Gửi dữ liệu sensor định kỳ
+    if (millis() - lastSensorSendTime >= SENSOR_SEND_INTERVAL) {
+        lastSensorSendTime = millis();
+        sendSensorData();
+    }
+
+    // --- Xử lý Gas ---
+    int gasValue = analogRead(GAS_PIN);
+    Serial.print("MQ2 = "); Serial.println(gasValue);
+
+    if (gasValue > gasThreshold) { // Báo động Gas
+        if (!gasAlarm) {
+            gasAlarm = true;
+            digitalWrite(FAN_ALARM_PIN, HIGH);
+            digitalWrite(BUZZER_PIN, HIGH);
+            doorServoGas.write(90); // Mở/Đóng van an toàn
+            Serial.println("⚠️ Cảnh báo Gas!!!");
+        }
+    } else { // Gas an toàn
+        if (gasAlarm) {
+            gasAlarm = false;
+            digitalWrite(FAN_ALARM_PIN, LOW);
+            digitalWrite(BUZZER_PIN, LOW);
+            doorServoGas.write(0); // Trở về trạng thái ban đầu
+            Serial.println("Gas bình thường");
+        }
+    }
+
+    // --- Xử lý RFID ---
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+        String rfidID = "";
+        // Đọc và chuyển UID sang chuỗi
+        for (byte i = 0; i < mfrc522.uid.size; i++) {
+            if (mfrc522.uid.uidByte[i] < 0x10) rfidID += "0";
+            rfidID += String(mfrc522.uid.uidByte[i], HEX);
+            if (i < mfrc522.uid.size - 1) rfidID += ":";
+        }
+        rfidID.toUpperCase();
+        Serial.print("RFID read: "); Serial.println(rfidID);
+
+        // Kiểm tra ID hợp lệ
+        bool valid = false;
+        for (int i = 0; i < sizeof(validIDs) / sizeof(validIDs[0]); i++) {
+            if (rfidID == validIDs[i]) valid = true;
+        }
+
+        if (valid) { // Mở khóa
+            Serial.println("RFID đúng! Mở khóa Servo");
+            doorServoRFID.write(90);
+            delay(3000);
+            doorServoRFID.write(0);
+        } else {
+            Serial.println("RFID không hợp lệ");
+        }
+        mfrc522.PICC_HaltA();
+    }
+
+    // --- Xử lý PIR ---
+    int pirState = digitalRead(pirPin); // Đọc trạng thái chuyển động
+
+    if (pirState == HIGH) { // Phát hiện chuyển động
+        digitalWrite(ledPin, HIGH);
+        Serial.println("Phat hien chuyen dong!");
+    } else { // Không phát hiện
+        Serial.println("DEOOOOO Phat hien chuyen dong!");
+        digitalWrite(ledPin, LOW);
+    }
+    delay(500);
+}
